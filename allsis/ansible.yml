@@ -1,0 +1,210 @@
+- name: Provision TOLE Project Server
+  hosts: all
+  become: yes
+  vars:
+    prometheus_version: "2.53.1"
+    grafana_version: "11.1.0"
+
+  tasks:
+    - name: --- SIS 2: USERS AND PERMISSIONS ---
+      tags: users
+      block:
+        - name: Create 'tole_app' and 'monitoring' groups
+          ansible.builtin.group:
+            name: "{{ item }}"
+            state: present
+            system: yes
+          loop:
+            - tole_app
+            - monitoring
+
+        - name: Create service users (tole, prometheus, grafana)
+          ansible.builtin.user:
+            name: "{{ item.name }}"
+            group: "{{ item.group }}"
+            system: yes
+            shell: /bin/false
+            create_home: no
+          loop:
+            - { name: 'tole', group: 'tole_app' }
+            - { name: 'prometheus', group: 'monitoring' }
+            - { name: 'grafana', group: 'monitoring' }
+
+        - name: Create automation_bot user
+          ansible.builtin.user:
+            name: automation_bot
+            shell: /bin/bash
+            state: present
+            create_home: yes
+
+        - name: Add passwordless sudo for automation_bot
+          ansible.builtin.lineinfile:
+            path: /etc/sudoers.d/automation_bot
+            line: "automation_bot ALL=(ALL) NOPASSWD: ALL"
+            create: yes
+            validate: 'visudo -cf %s'
+            mode: '0440'
+
+        - name: Create project directories
+          ansible.builtin.file:
+            path: "{{ item.path }}"
+            state: directory
+            owner: "{{ item.owner }}"
+            group: "{{ item.group }}"
+            mode: "{{ item.mode }}"
+          loop:
+            - { path: '/var/www/tole', owner: 'tole', group: 'tole_app', mode: '0775' }
+            - { path: '/var/log/tole', owner: 'tole', group: 'tole_app', mode: '0775' }
+            - { path: '/etc/tole', owner: 'tole', group: 'tole_app', mode: '0775' }
+            - { path: '/var/lib/prometheus', owner: 'prometheus', group: 'monitoring', mode: '0755' }
+            - { path: '/etc/prometheus', owner: 'prometheus', group: 'monitoring', mode: '0755' }
+            - { path: '/var/lib/grafana', owner: 'grafana', group: 'monitoring', mode: '0755' }
+            - { path: '/etc/grafana', owner: 'grafana', group: 'monitoring', mode: '0755' }
+            - { path: '/opt/scripts', owner: 'root', group: 'root', mode: '0755' }
+
+    - name: --- SIS 3: PACKAGES AND FIREWALL ---
+      tags: packages
+      block:
+        - name: Update apt cache
+          ansible.builtin.apt:
+            update_cache: yes
+            cache_valid_time: 3600
+
+        - name: Install system packages
+          ansible.builtin.apt:
+            name:
+              - build-essential
+              - python3-pip
+              - python3-dev
+              - mysql-server
+              - libmysqlclient-dev
+              - ufw
+            state: present
+
+        - name: Install Python packages
+          ansible.builtin.pip:
+            name:
+              - django
+              - gunicorn
+              - mysqlclient
+              - prometheus-client
+            executable: pip3
+            state: present
+
+        - name: Download and unarchive Prometheus
+          ansible.builtin.unarchive:
+            src: "https://github.com/prometheus/prometheus/releases/download/v{{ prometheus_version }}/prometheus-{{ prometheus_version }}.linux-amd64.tar.gz"
+            dest: /tmp/
+            remote_src: yes
+            creates: "/tmp/prometheus-{{ prometheus_version }}.linux-amd64/prometheus"
+
+        - name: Copy Prometheus binaries
+          ansible.builtin.copy:
+            src: "/tmp/prometheus-{{ prometheus_version }}.linux-amd64/{{ item }}"
+            dest: "/usr/local/bin/{{ item }}"
+            remote_src: yes
+            mode: '0755'
+            owner: 'prometheus'
+            group: 'monitoring'
+          loop:
+            - prometheus
+            - promtool
+
+        - name: Download and unarchive Grafana
+          ansible.builtin.unarchive:
+            src: "https://dl.grafana.com/oss/release/grafana-{{ grafana_version }}.linux-amd64.tar.gz"
+            dest: /tmp/
+            remote_src: yes
+            creates: "/tmp/grafana-{{ grafana_version }}/bin/grafana-server"
+
+        - name: Copy Grafana binaries
+          ansible.builtin.copy:
+            src: "/tmp/grafana-{{ grafana_version }}/bin/{{ item }}"
+            dest: "/usr/local/bin/{{ item }}"
+            remote_src: yes
+            mode: '0755'
+            owner: 'grafana'
+            group: 'monitoring'
+          loop:
+            - grafana-server
+            - grafana-cli
+
+        - name: Configure UFW rules
+          community.general.ufw:
+            rule: "{{ item.rule }}"
+            port: "{{ item.port | default(omit) }}"
+            proto: "{{ item.proto | default(omit) }}"
+          loop:
+            - { rule: 'allow', port: '22', proto: 'tcp' }
+            - { rule: 'allow', port: '80', proto: 'tcp' }
+            - { rule: 'allow', port: '443', proto: 'tcp' }
+            - { rule: 'allow', port: '8000', proto: 'tcp' }
+            - { rule: 'allow', port: '9090', proto: 'tcp' }
+            - { rule: 'allow', port: '3000', proto: 'tcp' }
+
+        - name: Enable UFW
+          community.general.ufw:
+            state: enabled
+            default: deny
+
+    - name: --- SIS 4: SERVICES AND CRON ---
+      tags: services
+      block:
+        - name: Copy systemd unit file for Gunicorn
+          ansible.builtin.template:
+            src: tole-gunicorn.service.j2
+            dest: /etc/systemd/system/tole-gunicorn.service
+            mode: '0644'
+          notify: reload systemd
+
+        - name: Copy systemd unit file for Prometheus
+          ansible.builtin.template:
+            src: prometheus.service.j2
+            dest: /etc/systemd/system/prometheus.service
+            mode: '0644'
+          notify: reload systemd
+
+        - name: Copy systemd unit file for Grafana
+          ansible.builtin.template:
+            src: grafana-server.service.j2
+            dest: /etc/systemd/system/grafana-server.service
+            mode: '0644'
+          notify: reload systemd
+
+        - name: Ensure services are started and enabled
+          ansible.builtin.systemd:
+            name: "{{ item }}"
+            state: started
+            enabled: yes
+          loop:
+            - tole-gunicorn
+            - prometheus
+            - grafana-server
+
+        - name: Copy maintenance scripts
+          ansible.builtin.copy:
+            src: "{{ item }}"
+            dest: "/opt/scripts/{{ item }}"
+            mode: '0755'
+          loop:
+            - backup.sh
+            - cleanup.sh
+
+        - name: Schedule backup cron job
+          ansible.builtin.cron:
+            name: "Backup TOLE project"
+            minute: "0"
+            hour: "2"
+            job: "/opt/scripts/backup.sh"
+
+        - name: Schedule cleanup cron job
+          ansible.builtin.cron:
+            name: "Cleanup old logs"
+            minute: "0"
+            hour: "4"
+            job: "/opt/scripts/cleanup.sh"
+
+  handlers:
+    - name: reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: yes
